@@ -8,11 +8,13 @@ scenarios:
   output_dir: data/scenarios
 
 experiment:
-  backend: mlx
-  # Cached locally at full precision, not quantized. Smaller Qwen sizes barely
-  # separated valid from invalid requests in smoke tests.
-  model: Qwen/Qwen2.5-3B-Instruct
-  # Never download weights; use only what is already in the Hugging Face cache.
+  # Llama 3.3 70B on Amazon Bedrock, reached through the AWS MCP relay
+  # (scripts/04_bedrock_relay.py). For a local run on Apple Silicon instead, use
+  # backend: mlx with model: Qwen/Qwen2.5-3B-Instruct.
+  backend: bedrock
+  model: us.meta.llama3-3-70b-instruct-v1:0
+  bedrock_region: us-east-1
+  # MLX only: never download weights; use only what is already in the Hugging Face cache.
   offline: true
   mode: controlled
   split: dev

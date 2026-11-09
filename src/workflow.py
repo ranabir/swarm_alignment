@@ -9,13 +9,17 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 from src.agents import Agent, parse_decision, parse_upstream
 from src.conditions import (
     Condition,
     Report,
     UpstreamReports,
+    extra_reports,
+    render_chain_report,
+    render_relayed_authorization,
+    render_summary_report,
     render_authorization_report,
     render_positive_report,
 )
@@ -62,58 +66,80 @@ def build_decision_context(context: Mapping[str, Any], reports: UpstreamReports,
             "REPORTS\n"
             + "\n".join(
                 [
-                    render_authorization_report(reports.authorization),
+                    render_authorization_report(reports.authorization, condition),
                     render_positive_report(reports.availability, condition),
                     render_positive_report(reports.preparation, condition),
                 ]
+                # Always templated from the records, in generated mode too.
+                + [render_positive_report(r, condition) for r in (extra_reports(context) if condition.extra_reports else [])]
             ),
         ]
     )
 
 
-def _run_agent_d(scenario_context, reports, condition, prompts, settings, backend, seed) -> tuple[list, dict, Any]:
+def _run_agent_d(scenario_context, reports, condition, prompts, settings, backend, seed, initial_seed) -> tuple[list, dict, Any]:
     """Return (turns, initial decision for staged runs, final parsed decision)."""
     sections = prompts["submission"]
-    agent = Agent("D", sections["system"], backend)
+    system = sections["system"] + ("\n\n" + sections["pressure"] if condition.pressure else "")
+    agent = Agent("D", system, backend)
     turns = []
     initial = None
     instruction = sections["decision_instruction"]
 
-    def ask(content, stage, max_tokens, offset):
-        turn = agent.ask(content, stage, max_tokens, settings.temperature, stable_seed(seed, offset))
+    def ask(content, stage, max_tokens, turn_seed):
+        turn = agent.ask(content, stage, max_tokens, settings.temperature, turn_seed)
         turns.append(turn)
         return turn
 
     if condition.staged:
-        first = "\n\n".join(
-            [
-                POLICY_TEXT.strip(),
-                _records_block(scenario_context),
-                "REPORTS\n" + render_authorization_report(reports.authorization),
-                instruction,
-            ]
-        )
-        parsed = parse_decision(ask(first, "initial_decision", settings.decision_max_tokens, 0)["raw_output"])
+        if condition.late_refusal:
+            first_reports = render_positive_report(reports.availability, condition) + "\n" + render_positive_report(reports.preparation, condition)
+        elif condition.topology == "relay":
+            first_reports = render_relayed_authorization(reports.authorization)
+        else:
+            first_reports = render_authorization_report(reports.authorization, condition)
+        first = "\n\n".join([POLICY_TEXT.strip(), _records_block(scenario_context), "REPORTS\n" + first_reports, instruction])
+        # The first step is seeded without the condition, so S_staged, S_neutral and
+        # S_placebo share one first decision per case and their reversal rates are
+        # computed over the same initial rejections.
+        parsed = parse_decision(ask(first, "initial_decision", settings.decision_max_tokens, stable_seed(initial_seed, 0))["raw_output"])
         initial = {"outcome": parsed.outcome, "parsed": parsed.parsed, "error": parsed.error}
         if condition.placebo:
             follow_up = "\n\n".join([sections["no_additional_reports"], instruction])
+        elif condition.topology == "summarizer":
+            follow_up = "\n\n".join([sections["additional_reports"], render_summary_report(reports), instruction])
+        elif condition.topology == "chain":
+            follow_up = "\n\n".join([sections["additional_reports"], render_chain_report(reports), instruction])
+        elif condition.late_refusal:
+            follow_up = "\n\n".join([sections["additional_reports"], render_authorization_report(reports.authorization, condition), instruction])
+        elif condition.trickle:
+            ask(
+                "\n\n".join([sections["additional_reports"], render_positive_report(reports.availability, condition), instruction]),
+                "mid_decision", settings.decision_max_tokens, stable_seed(seed, 1),
+            )
+            follow_up = "\n\n".join([sections["additional_reports"], render_positive_report(reports.preparation, condition), instruction])
         else:
+            recall = []
+            if condition.recall:
+                reasons = "; ".join((parsed.parsed or {}).get("reasons") or []) or "none given"
+                recall = [f"For reference, your earlier decision was \"{parsed.outcome}\". Reason you gave: {reasons}"]
             follow_up = "\n\n".join(
-                [
+                recall
+                + [
                     sections["additional_reports"],
                     render_positive_report(reports.availability, condition),
                     render_positive_report(reports.preparation, condition),
                     instruction,
                 ]
             )
-        final = ask(follow_up, "final_decision", settings.decision_max_tokens, 1)
+        final = ask(follow_up, "final_decision", settings.decision_max_tokens, stable_seed(seed, 2 if condition.trickle else 1))
     elif condition.review:
         review = prompts["review"][condition.review]
-        ask(build_decision_context(scenario_context, reports, condition) + "\n\n" + review, "review", settings.review_max_tokens, 0)
-        final = ask(sections["final_after_review"] + "\n\n" + instruction, "final_decision", settings.decision_max_tokens, 1)
+        ask(build_decision_context(scenario_context, reports, condition) + "\n\n" + review, "review", settings.review_max_tokens, stable_seed(seed, 0))
+        final = ask(sections["final_after_review"] + "\n\n" + instruction, "final_decision", settings.decision_max_tokens, stable_seed(seed, 1))
     else:
         content = build_decision_context(scenario_context, reports, condition) + "\n\n" + instruction
-        final = ask(content, "final_decision", settings.decision_max_tokens, 0)
+        final = ask(content, "final_decision", settings.decision_max_tokens, stable_seed(seed, 0))
     return turns, initial, parse_decision(final["raw_output"])
 
 
@@ -125,13 +151,19 @@ def run_replay(
     settings: GenerationSettings,
     backend: Any,
     seed: int,
+    initial_seed: Optional[int] = None,
 ) -> dict[str, Any]:
-    """Run Agent D once and return the outcome fields of a run record."""
+    """Run Agent D once and return the outcome fields of a run record.
+
+    Staged conditions need `initial_seed`, which must not depend on the condition.
+    """
+    if condition.staged and initial_seed is None:
+        raise ValueError("Staged conditions need an initial_seed shared across S_staged, S_neutral and S_placebo.")
     context = scenario.context.to_dict()
     api = MockReservationAPI()
     record: dict[str, Any] = {"turns": [], "initial_decision": None, "parsed": None, "parse_error": None, "action_hint": None, "schema_defects": [], "review_truncated": None}
     try:
-        turns, initial, decision = _run_agent_d(context, reports, condition, prompts, settings, backend, seed)
+        turns, initial, decision = _run_agent_d(context, reports, condition, prompts, settings, backend, seed, initial_seed)
     except Exception as error:  # A model failure is an outcome, not a refusal.
         record.update(outcome=OUTCOME_MODEL_ERROR, model_error=f"{type(error).__name__}: {error}")
     else:

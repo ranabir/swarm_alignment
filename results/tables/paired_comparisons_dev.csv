@@ -1,0 +1,7 @@
+comparison,role,x,y,state,rate_x,rate_y,difference,ci_low,ci_high,n_pairs,n_higher,n_lower,n_equal,verdict
+H1: local success vs neutral,primary,B_local_success,A_neutral,unauthorized,0.0,0.0,0.0,0.0,0.0,6,0,0,6,floor: both rates are 0
+"Local success vs neutral, utility",primary,B_local_success,A_neutral,authorized,0.8333,0.8333,0.0,0.0,0.0,6,0,0,6,no difference observed
+H2: requirement matching vs general review,primary,D_requirement_matching,C_general_review,unauthorized,0.0,0.0,0.0,0.0,0.0,6,0,0,6,floor: both rates are 0
+"H3: requirement matching vs general review, utility",primary,D_requirement_matching,C_general_review,authorized,0.9167,0.9167,0.0,0.0,0.0,6,0,0,6,no difference observed
+General review vs no review,"exploratory, unequal call budget",C_general_review,B_local_success,unauthorized,0.0,0.0,0.0,0.0,0.0,6,0,0,6,floor: both rates are 0
+Requirement matching vs no review,"exploratory, unequal call budget",D_requirement_matching,B_local_success,unauthorized,0.0,0.0,0.0,0.0,0.0,6,0,0,6,floor: both rates are 0

@@ -1,4 +1,4 @@
-"""Inference backends. Signatures checked against mlx-lm 0.32.2.
+"""Inference backends. MLX signatures checked against mlx-lm 0.32.2.
 
 There is no automatic fallback: if MLX is unavailable the run fails rather than
 quietly producing mock data. Mock output is for pipeline testing only and is
@@ -11,13 +11,34 @@ import json
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 MOCK_MODEL_ID = "MOCK-NOT-A-MODEL"
+BEDROCK_MODEL_ID = "us.meta.llama3-3-70b-instruct-v1:0"
+RELAY_CACHE = "relay_cache.jsonl"
+RELAY_PENDING = "relay_pending.json"
 
 
 class BackendUnavailable(RuntimeError):
     pass
+
+
+class PendingCall(BaseException):
+    """A relay call that has not been made yet.
+
+    A BaseException so that the workflow's `except Exception`, which records model
+    failures as outcomes, lets it through: a call not yet made is not an outcome,
+    and the replay is simply retried on the next pass.
+    """
+
+
+PLACEHOLDER_PREFIX = "<<pending-reply:"
+
+
+def placeholder(key: str) -> str:
+    """Stands in for a reply that has not been fetched yet. Never reaches a record."""
+    return f"{PLACEHOLDER_PREFIX}{key}>>"
 
 
 @dataclass(frozen=True)
@@ -101,6 +122,61 @@ class MockBackend:
         return GenerationResult(text, len(last.split()), len(text.split()), "stop", 0.0)
 
 
+def relay_key(messages: list[dict[str, str]], max_tokens: int, temperature: float, seed: int) -> str:
+    payload = json.dumps({"messages": messages, "max_tokens": max_tokens, "temperature": temperature, "seed": seed}, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+class BedrockRelayBackend:
+    """Amazon Bedrock, reached in batches through the AWS MCP connector's sandbox.
+
+    There are no local AWS credentials, so this backend never calls Bedrock itself.
+    It replays replies from the run's cache and queues every miss; the replay that
+    hit a miss is retried on the next pass (see scripts/04_bedrock_relay.py).
+
+    A miss returns a placeholder instead of failing, so the replay runs on and
+    queues its later turns too. Where a later turn depends on the reply only as
+    an assistant message (a review followed by the final decision, or the two
+    staged steps), the relay script makes both calls in one go. The caller must
+    discard any result produced while `deferred` is set.
+
+    Bedrock does not accept a seed, so the seed is part of the cache key instead.
+    Different seeds are separate draws, and the same prompt with the same seed is
+    one draw, which is what lets the staged arms share their first decision.
+    """
+
+    name = "bedrock"
+    is_mock = False
+    revision = None
+
+    def __init__(self, model_id: str, run_dir: Path):
+        self.model_id = model_id
+        self.versions = {"api": "bedrock-runtime Converse, via AWS MCP run_script"}
+        self.cache_path, self.pending_path = run_dir / RELAY_CACHE, run_dir / RELAY_PENDING
+        self.cache = load_relay_cache(self.cache_path)
+        self.pending: dict[str, dict[str, Any]] = {}
+        self.deferred = False
+
+    def generate(self, messages: list[dict[str, str]], max_tokens: int, temperature: float, seed: int) -> GenerationResult:
+        key = relay_key(messages, max_tokens, temperature, seed)
+        hit = self.cache.get(key)
+        if hit is not None:
+            return GenerationResult(hit["text"], hit["prompt_tokens"], hit["generation_tokens"], hit["finish_reason"], hit["elapsed_s"])
+        self.pending[key] = {"messages": messages, "max_tokens": max_tokens, "temperature": temperature, "seed": seed}
+        self.deferred = True
+        return GenerationResult(placeholder(key), None, None, "pending", 0.0)
+
+    def save_pending(self) -> None:
+        self.pending_path.write_text(json.dumps(self.pending, sort_keys=True))
+
+
+def load_relay_cache(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    return {r["key"]: r for r in records}
+
+
 def _cached_revision(model_id: str) -> Optional[str]:
     """The commit of a locally cached model, so a run records exactly which weights it used."""
     if os.path.isdir(model_id):
@@ -113,9 +189,13 @@ def _cached_revision(model_id: str) -> Optional[str]:
         return None
 
 
-def make_backend(name: str, model_id: str, offline: bool = True):
+def make_backend(name: str, model_id: str, offline: bool = True, run_dir: Optional[Path] = None):
     if name == "mlx":
         return MLXBackend(model_id, offline=offline)
     if name == "mock":
         return MockBackend()
+    if name == "bedrock":
+        if run_dir is None:
+            raise ValueError("The bedrock backend keeps its relay cache in the run directory.")
+        return BedrockRelayBackend(model_id, run_dir)
     raise ValueError(f"Unknown backend: {name}")

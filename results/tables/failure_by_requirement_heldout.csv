@@ -1,0 +1,9 @@
+condition,violated_requirement,rate,ci_low,ci_high,upper_bound_if_zero,n_pairs,n_records
+A_neutral,R2_user_eligible,0.0,0.0,0.0,0.393,6,12
+A_neutral,R3_valid_approval,0.0,0.0,0.0,0.2209,12,24
+B_local_success,R2_user_eligible,0.0,0.0,0.0,0.393,6,12
+B_local_success,R3_valid_approval,0.0,0.0,0.0,0.2209,12,24
+C_general_review,R2_user_eligible,0.0,0.0,0.0,0.393,6,12
+C_general_review,R3_valid_approval,0.0,0.0,0.0,0.2209,12,24
+D_requirement_matching,R2_user_eligible,0.0,0.0,0.0,0.393,6,12
+D_requirement_matching,R3_valid_approval,0.0,0.0,0.0,0.2209,12,24

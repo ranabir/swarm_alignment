@@ -4,6 +4,7 @@
 Usage:
     .venv/bin/python scripts/02_run_experiments.py --run-name smoke --limit-pairs 4 --reps 1
     .venv/bin/python scripts/02_run_experiments.py --backend mock --run-name pipeline_check
+    .venv/bin/python scripts/02_run_experiments.py --backend bedrock --run-name smoke_llama70b --limit-pairs 2
     .venv/bin/python scripts/02_run_experiments.py --freeze-prompts
 
 Held-out cases are refused until the prompts have been frozen, and refused again
@@ -30,7 +31,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from src.agents import load_prompts, prompts_sha256  # noqa: E402
 from src.conditions import CONDITIONS, PRIMARY_CONDITIONS, UpstreamReports, controlled_reports  # noqa: E402
 from src.metrics import format_outcome_table  # noqa: E402
-from src.model_backend import BackendUnavailable, make_backend  # noqa: E402
+from src.model_backend import PLACEHOLDER_PREFIX, BackendUnavailable, PendingCall, make_backend  # noqa: E402
 from src.policy_engine import POLICY_SHA256  # noqa: E402
 from src.schemas import DEV, TEST, Scenario  # noqa: E402
 from src.workflow import OUTCOME_MODEL_ERROR, GenerationSettings, generate_upstream, run_replay, stable_seed  # noqa: E402
@@ -96,7 +97,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", type=Path, default=REPO_ROOT / "config.yaml")
     parser.add_argument("--run-name")
-    parser.add_argument("--backend", choices=["mlx", "mock"])
+    parser.add_argument("--backend", choices=["mlx", "mock", "bedrock"])
     parser.add_argument("--model")
     parser.add_argument("--mode", choices=["controlled", "generated"])
     parser.add_argument("--split", choices=[DEV, TEST, "all"])
@@ -189,30 +190,33 @@ def main() -> int:
     pending = [job for job in jobs if (job[1].scenario_id, job[2], job[0]) not in done]
     print(f"Run {run_name}: {len(jobs)} replays, {len(jobs) - len(pending)} already complete, {len(pending)} to run.")
 
+    run_dir.mkdir(parents=True, exist_ok=True)
     try:
         started = time.perf_counter()
-        backend = make_backend(backend_name, model_id, offline=settings["offline"])
+        backend = make_backend(backend_name, model_id, offline=settings["offline"], run_dir=run_dir)
     except BackendUnavailable as error:
         print(f"Backend unavailable: {error}", file=sys.stderr)
         return 1
     print(f"Loaded {backend.model_id} (revision {backend.revision}) in {time.perf_counter() - started:.1f}s")
 
-    run_dir.mkdir(parents=True, exist_ok=True)
     if not config_path.exists():
         environment = {"python": platform.python_version(), "machine": platform.machine(), "versions": backend.versions, "revision": backend.revision}
         config_path.write_text(json.dumps({**run_config, "environment": environment}, indent=2, sort_keys=True) + "\n")
 
     prompts = load_prompts()
-    consecutive_errors = 0
-    for number, (rep, scenario, condition_key) in enumerate(pending, start=1):
+
+    def run_job(rep: int, scenario: Scenario, condition_key: str) -> dict[str, Any]:
         upstream_info = None
         if mode == "controlled":
-            reports = controlled_reports(scenario.context.to_dict())
+            reports = controlled_reports(scenario.context.to_dict(), CONDITIONS[condition_key])
         else:
             # Generated once per scenario and repetition, then shared across conditions.
             cached = upstream_cache.get((scenario.scenario_id, rep))
             if cached is None:
                 result = generate_upstream(scenario, prompts, generation, backend, stable_seed(seed, "upstream", scenario.scenario_id, rep))
+                if getattr(backend, "deferred", False):
+                    # Reports built from placeholders must never be stored or shown to Agent D.
+                    raise PendingCall("upstream")
                 cached = {"scenario_id": scenario.scenario_id, "rep": rep, "is_mock": backend.is_mock, "model": backend.model_id, **result}
                 append_jsonl(upstream_path, cached)
                 upstream_cache[(scenario.scenario_id, rep)] = cached
@@ -220,8 +224,10 @@ def main() -> int:
             upstream_info = cached["grades"]
 
         replay_seed = stable_seed(seed, scenario.scenario_id, condition_key, rep)
-        outcome = run_replay(scenario, CONDITIONS[condition_key], reports, prompts, generation, backend, replay_seed)
-        record = {
+        # No condition in this seed: every staged arm gets the same first decision.
+        initial_seed = stable_seed(seed, "initial", scenario.scenario_id, rep)
+        outcome = run_replay(scenario, CONDITIONS[condition_key], reports, prompts, generation, backend, replay_seed, initial_seed=initial_seed)
+        return {
             "run_name": run_name,
             "backend": backend.name,
             "is_mock": backend.is_mock,
@@ -238,23 +244,45 @@ def main() -> int:
             "violated_requirement": scenario.violated_requirement,
             "ground_truth_decision": scenario.ground_truth.decision,
             "seed": replay_seed,
+            "initial_seed": initial_seed if CONDITIONS[condition_key].staged else None,
             "temperature": temperature,
             "reports": reports.to_dict(),
             "upstream_grades": upstream_info,
             "completed_at": datetime.now(timezone.utc).isoformat(),
             **outcome,
         }
-        append_jsonl(records_path, record)
 
+    consecutive_errors = 0
+    waiting = 0
+    for number, (rep, scenario, condition_key) in enumerate(pending, start=1):
+        if hasattr(backend, "deferred"):
+            backend.deferred = False
+        try:
+            record = run_job(rep, scenario, condition_key)
+        except PendingCall:
+            waiting += 1
+            continue
+        if getattr(backend, "deferred", False):
+            # Relay backend: some reply in this replay was a placeholder, so it waits for the next pass.
+            waiting += 1
+            continue
+        if PLACEHOLDER_PREFIX in json.dumps(record):
+            raise SystemExit(f"A placeholder reached the record for {scenario.scenario_id} {condition_key}; refusing to write it.")
+        append_jsonl(records_path, record)
         print(f"[{number}/{len(pending)}] {scenario.scenario_id} {condition_key} rep={rep} -> {record['outcome']}", flush=True)
         consecutive_errors = consecutive_errors + 1 if record["outcome"] == OUTCOME_MODEL_ERROR else 0
         if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
             print(f"Stopping after {MAX_CONSECUTIVE_ERRORS} model errors in a row: {record['model_error']}", file=sys.stderr)
             return 1
 
+    if hasattr(backend, "save_pending"):
+        backend.save_pending()
+        if waiting:
+            print(f"\n{waiting} replays wait on {len(backend.pending)} queued Bedrock calls. Next: scripts/04_bedrock_relay.py script --run-name {run_name}")
+        else:
+            print("\nNo Bedrock calls pending: the run is complete.")
     print("\n" + format_outcome_table(read_jsonl(records_path)))
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

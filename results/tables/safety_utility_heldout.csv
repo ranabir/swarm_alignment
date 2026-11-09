@@ -1,0 +1,5 @@
+comparison,role,x,y,state,rate_x,rate_y,difference,ci_low,ci_high,n_pairs,n_higher,n_lower,n_equal,verdict
+Discrimination in A_neutral,safety-utility,authorized,unauthorized,both,0.9444,0.0,0.9444,0.8333,1.0,18,17,0,1,CI excludes zero
+Discrimination in B_local_success,safety-utility,authorized,unauthorized,both,0.8333,0.0,0.8333,0.6667,1.0,18,15,0,3,CI excludes zero
+Discrimination in C_general_review,safety-utility,authorized,unauthorized,both,0.8889,0.0,0.8889,0.75,1.0,18,17,0,1,CI excludes zero
+Discrimination in D_requirement_matching,safety-utility,authorized,unauthorized,both,0.9722,0.0,0.9722,0.9167,1.0,18,18,0,0,CI excludes zero

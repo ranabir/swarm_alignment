@@ -13,10 +13,11 @@ from src.conditions import (
     PRIMARY_CONDITIONS,
     UpstreamReports,
     controlled_reports,
+    extra_reports,
     render_authorization_report,
     render_positive_report,
 )
-from src.model_backend import GenerationResult, MockBackend, make_backend
+from src.model_backend import RELAY_CACHE, GenerationResult, MockBackend, make_backend
 from src.policy_engine import POLICY_TEXT, evaluate
 from src.scenario_generator import generate_scenarios
 from src.schemas import ALLOW, AUTHORIZED, DENY, UNAUTHORIZED
@@ -66,7 +67,7 @@ def pick(scenarios, state=UNAUTHORIZED):
 
 def replay(scenario, key, backend, prompts):
     reports = controlled_reports(scenario.context.to_dict())
-    return run_replay(scenario, CONDITIONS[key], reports, prompts, SETTINGS, backend, seed=1)
+    return run_replay(scenario, CONDITIONS[key], reports, prompts, SETTINGS, backend, seed=1, initial_seed=7)
 
 
 # --- Controlled reports are truthful ---
@@ -112,14 +113,141 @@ def test_reports_use_only_records_not_labels(scenarios):
 # --- Conditions differ only in what they are meant to ---
 
 
-def test_neutral_has_no_success_language_and_pass_adds_only_a_label(scenarios):
+def test_pass_adds_only_the_label_and_no_success_language(scenarios):
     for s in scenarios:
         reports = controlled_reports(s.context.to_dict())
-        for report, success in ((reports.availability, "Availability check succeeded."), (reports.preparation, "Preparation check succeeded.")):
+        for report in (reports.availability, reports.preparation):
             neutral = render_positive_report(report, CONDITIONS["A_neutral"])
             with_pass = render_positive_report(report, CONDITIONS["B_local_success"])
-            assert "PASS" not in neutral and "succeeded" not in neutral
-            assert with_pass.replace(f"PASS: {success} ", "") == neutral
+            assert "PASS" not in neutral
+            assert "succeeded" not in with_pass
+            assert with_pass.replace("PASS: ", "", 1) == neutral
+
+
+def test_a_and_b_decision_contexts_differ_only_by_pass_labels(scenarios):
+    context = pick(scenarios).context.to_dict()
+    reports = controlled_reports(context)
+    a = build_decision_context(context, reports, CONDITIONS["A_neutral"])
+    b = build_decision_context(context, reports, CONDITIONS["B_local_success"])
+    assert b.count("PASS: ") == 2
+    assert b.replace("PASS: ", "") == a
+
+
+def test_all_neutral_drops_the_refusal_label_and_nothing_else(scenarios):
+    context = pick(scenarios).context.to_dict()
+    reports = controlled_reports(context)
+    a = build_decision_context(context, reports, CONDITIONS["A_neutral"])
+    f = build_decision_context(context, reports, CONDITIONS["F_all_neutral"])
+    assert "REFUSE" in a and "REFUSE" not in f and "PASS" not in f
+    assert a.replace("REFUSE: ", "", 1) == f
+    # The refusal still states the violation as a fact.
+    assert reports.authorization.observation in f
+
+
+def test_no_verdict_reports_raw_data_without_conclusions(scenarios):
+    """G_no_verdict: A reports raw record data, no status, no evaluative language."""
+    condition = CONDITIONS["G_no_verdict"]
+    for s in scenarios:
+        context = s.context.to_dict()
+        reports = controlled_reports(context, condition)
+        auth = reports.authorization
+        # No verdict at all.
+        assert auth.status is None
+        obs = auth.observation
+        # Contains the user's eligibility_status as a raw field.
+        assert f'eligibility_status "{context["user"]["eligibility_status"]}"' in obs
+        # Contains every approval record on file.
+        for a in context["approvals"]:
+            assert a["approval_id"] in obs
+            assert a["user_id"] in obs
+            assert a["resource_id"] in obs
+            assert a["expires_on"] in obs
+        # Contains the request's user and resource.
+        assert context["request"]["user_id"] in obs
+        assert context["request"]["resource_id"] in obs
+        # Does NOT contain evaluative words.
+        obs_lower = obs.lower()
+        for phrase in ("not eligible", "is not valid", "is missing", "expired", "is eligible", "is valid",
+                       "refuse", "clear", "permitted", "not_permitted", "reject", "submit"):
+            assert phrase not in obs_lower, f"Found evaluative phrase '{phrase}' in factual report"
+        # B and C are unchanged.
+        assert reports.availability.status == "PASS"
+        assert reports.preparation.status == "PASS"
+
+
+def test_no_verdict_renders_without_any_label(scenarios):
+    """The rendered G report has no status label at all."""
+    context = pick(scenarios).context.to_dict()
+    reports = controlled_reports(context, CONDITIONS["G_no_verdict"])
+    rendered = render_authorization_report(reports.authorization, CONDITIONS["G_no_verdict"])
+    assert "REFUSE" not in rendered and "CLEAR" not in rendered
+    assert rendered.startswith("Report from Agent A (Authorization):")
+    assert "eligibility_status" in rendered
+
+
+def test_no_verdict_b_and_c_still_say_pass(scenarios):
+    """G_no_verdict keeps PASS on B and C — only A's verdict is removed."""
+    context = pick(scenarios).context.to_dict()
+    reports = controlled_reports(context, CONDITIONS["G_no_verdict"])
+    b = render_positive_report(reports.availability, CONDITIONS["G_no_verdict"])
+    c = render_positive_report(reports.preparation, CONDITIONS["G_no_verdict"])
+    assert "PASS:" in b and "PASS:" in c
+
+
+def test_no_verdict_neutral_removes_all_labels(scenarios):
+    """G_no_verdict_neutral: A has no verdict, B and C have no PASS labels."""
+    context = pick(scenarios).context.to_dict()
+    reports = controlled_reports(context, CONDITIONS["G_no_verdict_neutral"])
+    assert reports.authorization.status is None
+    b = render_positive_report(reports.availability, CONDITIONS["G_no_verdict_neutral"])
+    c = render_positive_report(reports.preparation, CONDITIONS["G_no_verdict_neutral"])
+    assert "PASS" not in b and "PASS" not in c
+
+
+def test_no_verdict_and_standard_share_b_and_c(scenarios):
+    """A's observation changes; B and C are identical."""
+    context = pick(scenarios).context.to_dict()
+    standard = controlled_reports(context)
+    factual = controlled_reports(context, CONDITIONS["G_no_verdict"])
+    assert factual.availability == standard.availability
+    assert factual.preparation == standard.preparation
+    assert factual.authorization.observation != standard.authorization.observation
+
+
+def test_extra_reports_are_true_and_silent_on_eligibility_and_approval(scenarios):
+    for s in scenarios:
+        context = s.context.to_dict()
+        request = context["request"]
+        reports = extra_reports(context)
+        assert [r.status for r in reports] == ["PASS"] * 4
+        text = " ".join(r.observation for r in reports).lower()
+        assert "eligib" not in text and "approv" not in text and "permit" not in text
+        assert context["user"]["name"] in reports[0].observation and context["user"]["user_id"] == request["user_id"]
+        assert context["resource"]["name"] in reports[1].observation and context["resource"]["resource_id"] == request["resource_id"]
+        assert int(reports[2].observation.split(" is ")[1].split()[0]) >= 0
+        assert int(reports[2].observation.split(" lasts ")[1].split()[0]) >= 1
+
+
+def test_many_pass_differs_from_many_neutral_only_by_six_labels(scenarios):
+    context = pick(scenarios).context.to_dict()
+    reports = controlled_reports(context)
+    many_pass = build_decision_context(context, reports, CONDITIONS["X_many_pass"])
+    many_neutral = build_decision_context(context, reports, CONDITIONS["X_many_neutral"])
+    assert many_pass.count("PASS: ") == 6
+    assert many_pass.replace("PASS: ", "") == many_neutral
+    # B's context with four more reports appended after C's.
+    assert many_pass.startswith(build_decision_context(context, reports, CONDITIONS["B_local_success"]) + "\n")
+
+
+def test_pressure_changes_only_the_system_prompt(scenarios, prompts):
+    calls = {}
+    for key in ("B_local_success", "X_pressure"):
+        backend = ScriptedBackend(REJECT)
+        replay(pick(scenarios), key, backend, prompts)
+        calls[key] = backend.calls[0]["messages"]
+    plain, pressured = calls["B_local_success"], calls["X_pressure"]
+    assert plain[1:] == pressured[1:]
+    assert pressured[0]["content"] == plain[0]["content"] + "\n\n" + prompts["submission"]["pressure"]
 
 
 def test_review_conditions_render_the_same_reports_as_b(scenarios):
@@ -135,11 +263,13 @@ def test_unattributed_changes_only_the_report_headers(scenarios):
     reports = controlled_reports(context)
     attributed = build_decision_context(context, reports, CONDITIONS["B_local_success"])
     unattributed = build_decision_context(context, reports, CONDITIONS["E_unattributed"])
-    normalized = attributed.replace("Report from Agent B (Availability):", "Database entry (availability):").replace(
-        "Report from Agent C (Preparation):", "Database entry (preparation):"
+    normalized = (
+        attributed.replace("Report from Agent A (Authorization):", "Database entry (authorization):")
+        .replace("Report from Agent B (Availability):", "Database entry (availability):")
+        .replace("Report from Agent C (Preparation):", "Database entry (preparation):")
     )
     assert normalized == unattributed
-    assert "Agent A (Authorization)" in unattributed
+    assert "Agent" not in unattributed.split("REPORTS")[1]
 
 
 @pytest.mark.parametrize("key", PRIMARY_CONDITIONS)
@@ -151,13 +281,16 @@ def test_every_primary_condition_shows_policy_records_and_refusal(scenarios, pro
         reports = controlled_reports(s.context.to_dict())
         assert POLICY_TEXT.strip() in first_prompt
         assert json.dumps(s.context.to_dict(), indent=1) in first_prompt
-        assert render_authorization_report(reports.authorization) in first_prompt
+        assert render_authorization_report(reports.authorization, CONDITIONS[key]) in first_prompt
         assert "REFUSE" in first_prompt
 
 
-def test_agent_a_report_is_identical_across_conditions(scenarios):
+def test_agent_a_report_varies_only_in_the_attribution_and_label_controls(scenarios):
     report = controlled_reports(pick(scenarios).context.to_dict()).authorization
-    assert len({render_authorization_report(report) for _ in CONDITIONS}) == 1
+    rendered = {key: render_authorization_report(report, c) for key, c in CONDITIONS.items()}
+    assert len({v for k, v in rendered.items() if k not in ("E_unattributed", "F_all_neutral", "S_staged_fail")}) == 1
+    assert rendered["S_staged_fail"] == rendered["B_local_success"].replace("REFUSE", "FAIL").replace("CLEAR", "PASS")
+    assert len(set(rendered.values())) == 4
 
 
 def test_c_and_d_have_the_same_call_structure_and_budget(scenarios, prompts):
@@ -222,8 +355,26 @@ def test_staged_neutral_differs_from_staged_only_by_the_pass_labels(scenarios, p
         replay(pick(scenarios), key, backend, prompts)
         seconds[key] = backend.calls[1]["messages"][-1]["content"]
     assert "PASS" not in seconds["S_neutral"]
-    stripped = seconds["S_staged"].replace("PASS: Availability check succeeded. ", "").replace("PASS: Preparation check succeeded. ", "")
-    assert stripped == seconds["S_neutral"]
+    assert seconds["S_staged"].replace("PASS: ", "") == seconds["S_neutral"]
+
+
+def test_staged_variants_share_the_first_seed_but_not_the_second(scenarios, prompts):
+    seeds = {}
+    s = pick(scenarios)
+    reports = controlled_reports(s.context.to_dict())
+    for number, key in enumerate(("S_staged", "S_neutral", "S_placebo")):
+        backend = ScriptedBackend(REJECT)
+        # As in script 02: the replay seed differs by condition, the initial seed does not.
+        run_replay(s, CONDITIONS[key], reports, prompts, SETTINGS, backend, seed=100 + number, initial_seed=7)
+        seeds[key] = [call["seed"] for call in backend.calls]
+    assert len({s[0] for s in seeds.values()}) == 1
+    assert len({s[1] for s in seeds.values()}) == 3
+
+
+def test_staged_replay_without_a_shared_seed_is_refused(scenarios, prompts):
+    s = pick(scenarios)
+    with pytest.raises(ValueError):
+        run_replay(s, CONDITIONS["S_staged"], controlled_reports(s.context.to_dict()), prompts, SETTINGS, ScriptedBackend(REJECT), seed=1)
 
 
 # --- Outcomes stay distinct and are never converted ---
@@ -358,7 +509,7 @@ def test_incorrect_generated_reports_pass_through_unchanged_and_are_graded(scena
     reports = UpstreamReports.from_dict(result["reports"])
     rendered = render_positive_report(reports.availability, CONDITIONS["B_local_success"])
     assert "FAIL" in rendered and "PASS" not in rendered
-    assert "CLEAR: Looks fine to me." in render_authorization_report(reports.authorization)
+    assert "CLEAR: Looks fine to me." in render_authorization_report(reports.authorization, CONDITIONS["B_local_success"])
 
 
 def test_unparseable_generated_report_is_kept_as_raw_text_and_flagged(scenarios, prompts):
@@ -387,6 +538,90 @@ def test_mock_backend_is_labelled_and_deterministic():
     assert backend.is_mock and "MOCK" in backend.model_id
     messages = [{"role": "user", "content": "requested_action"}]
     assert backend.generate(messages, 10, 0.5, 3) == MockBackend().generate(messages, 10, 0.5, 3)
+
+
+def _relay_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("relay", REPO_ROOT / "scripts" / "04_bedrock_relay.py")
+    relay = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(relay)
+    return relay
+
+
+def test_bedrock_relay_queues_misses_and_replays_hits(tmp_path, scenarios, prompts):
+    backend = make_backend("bedrock", "us.meta.llama3-3-70b-instruct-v1:0", run_dir=tmp_path)
+    assert not backend.is_mock
+    replay(pick(scenarios), "B_local_success", backend, prompts)
+    assert backend.deferred  # the caller must discard this replay
+    backend.save_pending()
+    queued = json.loads((tmp_path / "relay_pending.json").read_text())
+    assert len(queued) == 1
+    key = next(iter(queued))
+    reply = {"key": key, "text": REJECT, "prompt_tokens": 9, "generation_tokens": 3, "finish_reason": "stop", "stop_reason": "end_turn", "elapsed_s": 0.1}
+    (tmp_path / RELAY_CACHE).write_text(json.dumps(reply) + "\n")
+    fresh = make_backend("bedrock", "m", run_dir=tmp_path)
+    record = replay(pick(scenarios), "B_local_success", fresh, prompts)
+    assert not fresh.deferred and record["outcome"] == "reject"
+
+
+def test_bedrock_relay_queues_the_staged_follow_ups_behind_one_shared_first_call(tmp_path, scenarios, prompts):
+    from src.model_backend import placeholder
+
+    backend = make_backend("bedrock", "m", run_dir=tmp_path)
+    for key in ("S_staged", "S_neutral", "S_placebo"):
+        replay(pick(scenarios), key, backend, prompts)
+    roots = [k for k, c in backend.pending.items() if len(c["messages"]) == 2]
+    follow_ups = [c for c in backend.pending.values() if len(c["messages"]) == 4]
+    assert len(roots) == 1 and len(follow_ups) == 3
+    assert all(c["messages"][2] == {"role": "assistant", "content": placeholder(roots[0])} for c in follow_ups)
+
+
+def test_relay_round_trip_chains_follow_ups_and_completes_every_replay(tmp_path, scenarios, prompts, monkeypatch):
+    """Queue, script, a stand-in for the sandbox, ingest, then replay with no misses left."""
+    import argparse
+
+    relay = _relay_module()
+    run_dir, scripts = tmp_path / "run1", tmp_path / "scripts"
+    run_dir.mkdir()
+    scripts.mkdir()
+    (run_dir / "run_config.json").write_text(json.dumps({"model": "m"}))
+    monkeypatch.setattr(relay, "scripts_dir", lambda: scripts)
+    monkeypatch.setattr(relay, "run_paths", lambda run: {"dir": run_dir, "config": run_dir / "run_config.json", "cache": run_dir / RELAY_CACHE, "pending": run_dir / "relay_pending.json"})
+
+    jobs = [(s, key) for s in scenarios[:4] for key in ("B_local_success", "D_requirement_matching", "S_staged", "S_neutral", "S_placebo")]
+    backend = make_backend("bedrock", "m", run_dir=run_dir)
+    for s, key in jobs:
+        replay(s, key, backend, prompts)
+    backend.save_pending()
+    raw = sum(len(json.dumps(c)) for c in backend.pending.values())
+    assert relay.cmd_script(argparse.Namespace(run_name=["run1"])) == 0
+
+    results = []
+    for code_path in sorted(scripts.glob("batch*.py")):
+        code = code_path.read_text()
+        assert len(code) < raw / 3
+        namespace = {"json": json}
+        exec(code.split("sem = asyncio")[0], namespace)
+        replies, texts = [], {}
+        for i, (p, max_tokens, temperature, m) in enumerate(namespace["C"]):
+            used = {j: texts[j] for j in namespace["parents"](p)}
+            system_spec, turns = namespace["P"][p]
+            texts[i] = REJECT
+            replies.append({"i": i, "model": namespace["M"][m], "system": namespace["text_of"](system_spec, used),
+                            "messages": [[role, namespace["text_of"](spec, used)] for role, spec in turns],
+                            "text": texts[i], "stop": "end_turn", "in": 1, "out": 1, "ms": 1})
+        path = tmp_path / f"{code_path.stem}.json"
+        path.write_text(json.dumps({"return_value": {"batch": code_path.stem, "replies": replies}}))
+        results.append(path)
+    assert relay.cmd_ingest(argparse.Namespace(files=results)) == 0
+
+    fresh = make_backend("bedrock", "m", run_dir=run_dir)
+    for s, key in jobs:
+        fresh.deferred = False
+        record = replay(s, key, fresh, prompts)
+        assert not fresh.deferred, (s.scenario_id, key)
+        assert record["outcome"] == "reject"
 
 
 def test_unknown_backend_is_an_error_rather_than_a_fallback():
@@ -493,3 +728,14 @@ def test_generated_mode_shares_upstream_across_conditions(run_dir):
         assert r["report_source"] == "generated" and r["upstream_grades"] is not None
         by_scenario.setdefault(r["scenario_id"], []).append(json.dumps(r["reports"], sort_keys=True))
     assert all(len(set(v)) == 1 for v in by_scenario.values())
+
+
+def test_topology_reports_make_no_false_claims_and_keep_the_refusal_visible(scenarios):
+    from src.conditions import render_chain_report, render_relayed_authorization, render_summary_report
+
+    reports = controlled_reports(pick(scenarios).context.to_dict())
+    summary = render_summary_report(reports)
+    assert "Agents B and C" in summary and reports.authorization.observation not in summary
+    chain = render_chain_report(reports)
+    assert reports.authorization.observation in chain and reports.availability.observation in chain
+    assert reports.authorization.observation in render_relayed_authorization(reports.authorization)
